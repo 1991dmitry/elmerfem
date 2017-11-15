@@ -318,7 +318,9 @@ CONTAINS
         j = SlaveSolvers(i)
         PSolver => CurrentModel % Solvers(j)
         Var => PSolver % Variable 
+        VarName = Var % Name
         BlockMatrix % SubVector(i) % Solver => PSolver
+        BlockMatrix % SubMatrix(i,i) % Mat => PSolver % Matrix        
       ELSE
         WRITE (str,'(A,I0)') 'Variable ',i
 
@@ -778,6 +780,7 @@ CONTAINS
     TYPE(ValueList_t), POINTER :: Params
     TYPE(Matrix_t), POINTER :: A_fs, A_sf
     TYPE(Variable_t), POINTER :: FVar, SVar
+    LOGICAL, POINTER :: ConstrainedF(:), ConstrainedS(:)
     
     Params => Solver % Values
 
@@ -791,8 +794,7 @@ CONTAINS
 
     A_fs => TotMatrix % Submatrix(j,i) % Mat
     A_sf => TotMatrix % Submatrix(i,j) % Mat
-
-
+    
     IF(.NOT. ASSOCIATED( A_fs ) ) THEN
       CALL Fatal('FsiCouplingBlocks','Fluid-structure coupling matrix not allocated!')
     END IF
@@ -803,6 +805,9 @@ CONTAINS
     FVar => TotMatrix % Subvector(j) % Var
     SVar => TotMatrix % Subvector(i) % Var
 
+    ConstrainedS => TotMatrix % Submatrix(i,i) % Mat % ConstrainedDOF
+    ConstrainedF => TotMatrix % Submatrix(j,j) % Mat % ConstrainedDOF
+    
     IF(.NOT. ASSOCIATED( FVar ) ) THEN
       CALL Fatal('FsiCouplingBlocks','Fluid variable not present!')
     END IF
@@ -810,7 +815,8 @@ CONTAINS
       CALL Fatal('FsiCouplingBlocks','Structure variable not present!')
     END IF
         
-    CALL FsiCouplingAssembly( Solver, FVar, SVar, A_fs, A_sf )
+    CALL FsiCouplingAssembly( Solver, FVar, SVar, A_fs, A_sf, &
+        ConstrainedF, ConstrainedS )
 
   END SUBROUTINE FsiCouplingBlocks
     
@@ -879,10 +885,10 @@ CONTAINS
         rhs(1:n) = rhs(1:n) - rtmp(1:n)
       END DO
 
-      IF( ParEnv % PEs == 1 ) THEN
-        RhsNorm = SQRT( SUM( rhs**2 ) )
-        PRINT *,'RhsNorm:',NoRow, RhsNorm
-      END IF
+      !IF( ParEnv % PEs == 1 ) THEN
+      !  RhsNorm = SQRT( SUM( rhs**2 ) )
+      !  PRINT *,'RhsNorm:',NoRow, RhsNorm
+      !END IF
     END DO
     
     DEALLOCATE( rtmp )
@@ -891,18 +897,24 @@ CONTAINS
   
 
   !------------------------------------------------------------------------------
-  !> Perform matrix-vector product for block matrices.
+  !> Perform matrix-vector product v=Au for block matrices.
   !> Has to be callable outside the module by Krylov methods.
   !------------------------------------------------------------------------------
 !------------------------------------------------------------------------------
   SUBROUTINE BlockMatrixVectorProd( u,v,ipar )
 !------------------------------------------------------------------------------
-    INTEGER :: i,j,k,NoVar,ipar(*)
-    REAL(KIND=dp) :: u(*),v(*)
+    REAL(KIND=dp), INTENT(in) :: u(*)
+    REAL(KIND=dp), INTENT(out) :: v(*)
+    INTEGER, INTENT(in) :: ipar(*)
+    
+    INTEGER :: i,j,k,NoVar,i1,i2,j1,j2
     REAL(KIND=dp), ALLOCATABLE :: s(:)
     INTEGER :: maxsize,ndofs
     INTEGER, POINTER :: Offset(:)
     REAL(KIND=dp) :: nrm
+    TYPE(Matrix_t), POINTER :: A
+
+    REAL(KIND=dp), POINTER :: b(:)
     
     CALL Info('BlockMatrixVectorProd','Starting block matrix multiplication',Level=20)
     
@@ -927,19 +939,46 @@ CONTAINS
     DO i=1,NoVar
       DO j=1,NoVar
         s = 0._dp
-        IF (isParallel) THEN
-          CALL ParallelMatrixVector( TotMatrix % SubMatrix(i,j) % Mat, &
-                   u(offset(j)+1:offset(j+1)), s  )
-        ELSE
-          CALL CRS_MatrixVectorMultiply( TotMatrix % SubMatrix(i,j) % Mat, &
-                   u(offset(j)+1:offset(j+1)), s )
+        A => TotMatrix % SubMatrix(i,j) % Mat
+        
+        IF( MAXVAL( A % Cols ) /= offset(j+1)-offset(j) ) THEN
+          CALL Fatal('BlockMatrixVectorProd','Wrong max column index: '&
+              //TRIM(I2S(MAXVAL( A % Cols )))//' vs. '//TRIM(I2S(offset(j+1)-offset(j))))
         END IF
-        PRINT *,'MatVecProdNorm:',i,j,SQRT(SUM(s**2))
+        IF( A % NumberofRows /= offset(i+1)-offset(i)) THEN         
+          CALL Fatal('BlockMatrixVectorProd','Wrong max column index: '&
+              //TRIM(I2S( A % NumberOfRows ))//' vs. '//TRIM(I2S(offset(i+1)-offset(i))))
+        END IF
+          
+        j1 = offset(j)+1
+        j2 = offset(j+1)
+        
+        IF (isParallel) THEN
+          CALL ParallelMatrixVector( A, u(j1:j2), s  )
+        ELSE
+          CALL CRS_MatrixVectorMultiply( A, u(j1:j2), s )
+        END IF
+        
+        !PRINT *,'MatVecProdNorm u:',i,j,&
+        !    SQRT(SUM(u(j1:j2)**2)),SUM( u(j1:j2) ), MINVAL( u(j1:j2) ), MAXVAL( u(j1:j2) ) 
+        !PRINT *,'MatVecProdNorm s:',i,j,&
+        !    SQRT(SUM(s**2)), SUM( s ), MINVAL( s ), MAXVAL( s ) 
         
         DO k=1,offset(i+1)-offset(i)
           v(k+offset(i)) = v(k+offset(i)) + s(k)
         END DO
       END DO
+
+      i1 = offset(i)+1
+      i2 = offset(i+1)
+      b => TotMatrix % Submatrix(i,i) % Mat % Rhs
+
+      !PRINT *,'MatVecProdNorm b:',i,&
+      !    SQRT(SUM(b**2)),SUM( b ), MINVAL( b ), MAXVAL( b )
+      ! PRINT *,'MatVecProdNorm v:',i,&
+      !      SQRT(SUM(v(i1:i2)**2)), SUM( v(i1:i2) ), MINVAL( v(i1:i2) ), MAXVAL( v(i1:i2) ) 
+      
+      
     END DO
     
     ! Do the transpose stuff too
@@ -954,7 +993,7 @@ CONTAINS
           CALL CRS_TransposeMatrixVectorMultiply( TotMatrix % SubMatrix(i,j) % Mat, &
               u(offset(i)+1:offset(i+1)), s )
         END IF
-        PRINT *,'MatVecProdNorm Transpose:',i,j,SQRT(SUM(s**2))
+        !PRINT *,'MatVecProdNorm Transpose:',i,j,SQRT(SUM(s**2))
         
         DO k=1,offset(j+1)-offset(j)
           v(k+offset(j)) = v(k+offset(j)) + s(k)
@@ -962,12 +1001,11 @@ CONTAINS
       END DO
     END DO
 
-    nrm = SQRT( SUM( v(1:offset(NoVar+1))**2 ) )
-    PRINT *,'VectorProdNorm:',nrm
-    
-    
+    i = offset(NoVar+1)
+    nrm = SQRT( SUM( v(1:i)**2 ) )
 
-    
+    !PRINT *,'MatVecProdNorm full:',nrm, MINVAL( v(1:i) ), MAXVAL( v(1:i)), SUM( v(1:i) )
+           
     CALL Info('BlockMatrixVectorProd','Finished block matrix multiplication',Level=20)
 !------------------------------------------------------------------------------
   END SUBROUTINE BlockMatrixVectorProd
@@ -975,11 +1013,95 @@ CONTAINS
   
 
 !------------------------------------------------------------------------------
-!> Perform block preconditioning by solving all the individual diagonal problems.
+  SUBROUTINE BlockMatrixVectorProdZ( u,v,ipar )
+!------------------------------------------------------------------------------
+    INTEGER :: i,j,k,NoVar,ipar(*)
+    COMPLEX(KIND=dp) :: u(*),v(*)
+    COMPLEX(KIND=dp), ALLOCATABLE :: s(:)
+    INTEGER :: maxsize,ndofs
+    INTEGER, POINTER :: Offset(:)
+    INTEGER, ALLOCATABLE :: Zoffset(:)
+    COMPLEX(KIND=dp) :: nrm
+    
+    CALL Info('BlockMatrixVectorProdZ','Starting complex block matrix multiplication',Level=20)
+    
+    NoVar = TotMatrix % NoVar
+    Offset => TotMatrix % Offset
+    MaxSize = TotMatrix % MaxSize
+
+
+    ! Offset for complex valued system    
+    ALLOCATE( Zoffset( SIZE( Offset ) ) )
+    Zoffset = Offset / 2
+    
+  
+    IF (isParallel) THEN
+      CALL Fatal('','Do parallel complex')
+      !IF(.NOT.ASSOCIATED(TotMatrix % SubMatrix(1,NoVar) % Mat % ParMatrix)) THEN
+      !  IF(.NOT.ASSOCIATED(SolverMatrix)) THEN
+      !    CALL Fatal('BlockMatrixVectorProd','No matrix to apply.')
+      !  ELSE
+      !          CALL ParallelMatrixVector(SolverMatrix, u(1:ipar(3)), v(1:ipar(3)))
+      !  END IF
+      !  RETURN
+      !END IF
+    END IF
+
+    ALLOCATE( s(MaxSize/2) )
+
+    v(1:zoffset(NoVar+1)) = 0
+    DO i=1,NoVar
+      DO j=1,NoVar
+        s = CMPLX( 0.0_dp, 0.0_dp ) 
+        IF (isParallel) THEN
+          !CALL ParallelMatrixVector( TotMatrix % SubMatrix(i,j) % Mat, &
+          !         u(offset(j)+1:offset(j+1)), s  )
+        ELSE
+          CALL CRS_ComplexMatrixVectorMultiply( TotMatrix % SubMatrix(i,j) % Mat, &
+                   u(zoffset(j)+1:zoffset(j+1)), s )
+        END IF
+
+        DO k=1,(offset(i+1)-offset(i))
+          v(k+zoffset(i)) = v(k+zoffset(i)) + s(k)
+        END DO
+      END DO
+    END DO
+    
+    ! Do the transpose stuff too
+    DO i=1,NoVar
+      DO j=1,NoVar
+        IF( .NOT. TotMatrix % SubMatrixTranspose(i,j) ) CYCLE
+
+        s = CMPLX( 0.0_dp, 0.0_dp ) 
+        IF (isParallel) THEN
+          CALL Fatal('','Do transpose in parallel!')
+        ELSE
+          CALL Fatal('','Do transpose in complex!')
+          !CALL CRS_TransposeMatrixVectorMultiply( TotMatrix % SubMatrix(i,j) % Mat, &
+          !    u(offset(i)+1:offset(i+1)), s )
+        END IF
+        
+        DO k=1,zoffset(j+1)-zoffset(j)
+          v(k+zoffset(j)) = v(k+zoffset(j)) + s(k)
+        END DO
+      END DO
+    END DO
+
+    nrm = SQRT( SUM( v(1:zoffset(NoVar+1))**2 ) )
+       
+    CALL Info('BlockMatrixVectorProdZ','Finished block matrix multiplication',Level=20)
+!------------------------------------------------------------------------------
+  END SUBROUTINE BlockMatrixVectorProdZ
+!------------------------------------------------------------------------------
+
+  
+!------------------------------------------------------------------------------
+!> Perform block preconditioning for Au=v by solving all the individual diagonal problems.
 !> Has to be called outside the module by Krylov methods.
 !------------------------------------------------------------------------------
   SUBROUTINE BlockMatrixPrec( u,v,ipar )    
-    REAL(KIND=dp), TARGET :: u(*), v(*)
+    REAL(KIND=dp), TARGET, INTENT(out) :: u(*)
+    REAL(KIND=dp), TARGET, INTENT(in) :: v(*)
     INTEGER :: ipar(*)
 !---------------------------------------------------------------------------------
     REAL(KIND=dp), POINTER :: rtmp(:),vtmp(:),xtmp(:),b(:), x(:), rhs_save(:)
@@ -1016,7 +1138,7 @@ CONTAINS
     offset => TotMatrix % Offset
     SolverVar => Solver % Variable
 
-    rhs_save => Solver % Matrix % RHS
+    !rhs_save => Solver % Matrix % RHS
     mat_save => Solver % Matrix
 
     
@@ -1028,13 +1150,15 @@ CONTAINS
 
     ! Initial guess 
     !-----------------------------------------
-    u(1:offset(NoVar+1)) = v(1:offset(NoVar+1))
+    !u(1:offset(NoVar+1)) = v(1:offset(NoVar+1))
 
     IF( BlockGS ) THEN
       ALLOCATE( vtmp(offset(NoVar+1)), rtmp(offset(NoVar+1)), xtmp(offset(NoVar+1)))
       vtmp(1:offset(NoVar+1)) = v(1:offset(NoVar+1))
     END IF
 
+
+    CALL ListPushNameSpace('block:')
 
     DO j=1,NoVar
       IF( GotOrder ) THEN
@@ -1052,6 +1176,7 @@ CONTAINS
 
       IF( ASSOCIATED( TotMatrix % Subvector(i) % Solver ) ) THEN
         ASolver => TotMatrix % SubVector(i) % Solver
+        A => ASolver % Matrix
       ELSE
         A => TotMatrix % Submatrix(i,i) % PrecMat
         IF( A % NumberOfRows == 0 ) THEN
@@ -1064,7 +1189,7 @@ CONTAINS
         ASolver % Variable => Var        
         ASolver % Matrix => A
       END IF
-
+      
         
 #ifndef SOLSYS
       x => u(offset(i)+1:offset(i+1))
@@ -1097,7 +1222,7 @@ CONTAINS
         END IF
       END IF
 #endif
-      ASolver % Matrix % RHS => b
+      !ASolver % Matrix % RHS => b
 
       ! Reuse block preconditioner from the first block to other components
       !--------------------------------------------------------------------
@@ -1108,13 +1233,12 @@ CONTAINS
         END DO
       END IF
 
-      CALL ListPushNameSpace('block:')
       CALL ListPushNameSpace('block '//TRIM(i2s(i))//TRIM(i2s(i))//':')
         
       SkipCompChange = ListGetLogical( Params,'Skip Compute Nonlinear Change',Found)
       CALL ListAddLogical( Params,'Skip Compute Nonlinear Change',.TRUE.)
 
-      
+      !PRINT *,'Range pre:',i,TRIM(Var % Name), MINVAL(x),MAXVAL(x)
       
       IF (isParallel) THEN
 #ifndef SOLSYS
@@ -1134,6 +1258,9 @@ CONTAINS
         CALL SolveSystem( A, ParMatrix, b, x, Var % Norm, Var % DOFs, ASolver )
       END IF
 
+      !PRINT *,'Range post:',i,TRIM(Var % Name), MINVAL(x),MAXVAL(x)
+
+
 #ifdef SOLSYS
       IF (isParallel) THEN
         l = 0
@@ -1147,12 +1274,12 @@ CONTAINS
       END IF
 #endif
 
-      Solver % Matrix % RHS => rhs_save
+      !Solver % Matrix % RHS => rhs_save
       Solver % Matrix => mat_save
 
       !---------------------------------------------------------------------
       IF( BlockGS ) THEN        
-        CALL Info('BlockSolver','Computing block r.h.s',Level=5)
+        CALL Info('BlockSolver','Updating block r.h.s',Level=5)
       
         DO l=j+1,NoVar
           IF( GotOrder ) THEN
@@ -1164,6 +1291,8 @@ CONTAINS
           WRITE( str,'(A,I0,I0)') 'Block Gauss-Seidel Passive ',k,i
           IF( ListGetLogical( Params, str, Found ) ) CYCLE
         
+          CALL Info('BlockSolver','Updating r.h.s for component '//TRIM(I2S(k)),Level=15)
+
           ! The residual is used only as a temporary vector
           !-------------------------------------------------------------
           IF (isParallel) THEN
@@ -1187,11 +1316,15 @@ CONTAINS
               CALL CRS_MatrixVectorMultiply(TotMatrix % SubMatrix(k,i) % Mat,x,rtmp )
             END IF
           END IF
+          ! Up-date the off-diagonal entries to the r.h.s. 
           vtmp(offset(k)+1:offset(k+1)) = vtmp(offset(k)+1:offset(k+1)) &
                    - rtmp(1:offset(k+1)-offset(k))
-        END DO
+        END DO ! l=j+1,NoVar
       END IF
-    END DO
+
+      CALL ListPopNameSpace() ! block ij:
+      
+    END DO ! j=1,NoVar
 
 #ifdef SOLSYS
     IF (isParallel) DEALLOCATE(x,b)
@@ -1199,7 +1332,6 @@ CONTAINS
 #endif
 
     CALL ListPopNameSpace() ! block:
-    CALL ListPopNameSpace() ! block ij:
 
     CALL ListAddLogical( Params,'Linear System Refactorize',.FALSE. )
     CALL ListAddLogical( Params,'Skip Compute Nonlinear Change',SkipCompChange)
@@ -1214,6 +1346,7 @@ CONTAINS
   END SUBROUTINE BlockMatrixPrec
 
 
+  
   !-----------------------------------------------------------------
   !> This call takes care of Jacobi & Gauss Seidel block methods. 
   !-----------------------------------------------------------------
@@ -1288,8 +1421,8 @@ CONTAINS
         
         mat_Save => Solver % Matrix
         Solver % Matrix => A
-        rhs_save => Solver % Matrix % RHS
-        Solver % Matrix % RHS => b
+        !rhs_save => Solver % Matrix % RHS
+        !Solver % Matrix % RHS => b
         
         ! Solving the subsystem
         !-----------------------------------
@@ -1298,7 +1431,7 @@ CONTAINS
             Var % Values, Var % Norm, Var % DOFs, Solver )
         CALL ListPopNamespace()
         
-        Solver % Matrix % RHS => rhs_save
+        !Solver % Matrix % RHS => rhs_save
         Solver % Matrix => mat_save
         
         TotNorm = TotNorm + Var % Norm
@@ -1342,7 +1475,7 @@ CONTAINS
     INTEGER :: i,j,k,l,ia,ib,istat
     LOGICAL :: LS, BlockAV,Found
 
-    CALL Info('BlockKrylovIter','Starting block krylov iteration',Level=20)
+    CALL Info('BlockKrylovIter','Starting block system iteration',Level=8)
     
     CALL ListPushNameSpace('outer:')
     Params => Solver % Values
@@ -1353,7 +1486,8 @@ CONTAINS
     ndim = TotMatrix % TotSize 
     NoVar = TotMatrix % NoVar
 
-    CALL Info('BlockSolver','Allocating temporal vectors for GCR of size: '//TRIM(I2S(ndim)))
+    CALL Info('BlockSolver','Allocating temporal vectors for block system of size: '&
+        //TRIM(I2S(ndim)),Level=8)
 
     ALLOCATE(x(ndim), b(ndim),r(ndim),STAT=istat)
     IF( istat /= 0 ) THEN
@@ -1387,7 +1521,7 @@ CONTAINS
 
     IF (isParallel) ALLOCATE(poffset(NoVar+1))
 
-    CALL Info('BlockSolver','Initializing GCR vectors',Level=18)
+    CALL Info('BlockSolver','Initializing monolithic system vectors',Level=18)
     
     DO i=1,NoVar
 
@@ -1402,11 +1536,11 @@ CONTAINS
       END IF
       
       IF (.NOT.isParallel) THEN
-        x(offset(i)+1:offset(i+1)) = TotMatrix % SubVector(i) % Var % Values
-        
-        IF( ASSOCIATED( TotMatrix % Submatrix(i,i) % Mat % Rhs ) ) THEN
-           b(offset(i)+1:offset(i+1)) = TotMatrix % SubMatrix(i,i) % Mat % rhs
+        x(offset(i)+1:offset(i+1)) = TotMatrix % SubVector(i) % Var % Values        
+        IF( ASSOCIATED( TotMatrix % Submatrix(i,i) % Mat % Rhs ) ) THEN          
+          b(offset(i)+1:offset(i+1)) = TotMatrix % SubMatrix(i,i) % Mat % rhs
         END IF
+        
       ELSE
         A => TotMatrix % SubMatrix(i,i) % Mat
         poffset(i) = k
@@ -1439,8 +1573,13 @@ CONTAINS
     precProc = AddrFunc(BlockMatrixPrec)
     mvProc = AddrFunc(BlockMatrixVectorProd)
     
+    prevXnorm = SQRT( SUM( b**2 ) )
+    WRITE( Message,'(A,ES12.3)') 'Rhs norm at start: ',PrevXnorm
+    CALL Info('BlockKrylovIter',Message,Level=10)
+
     prevXnorm = SQRT( SUM( x**2 ) )
-    PRINT *,'Start norm:',prevXnorm
+    WRITE( Message,'(A,ES12.3)') 'Solution norm at start: ',PrevXnorm
+    CALL Info('BlockKrylovIter',Message,Level=10)
 
     CALL info('BlockSolver','Start of blocks system iteration',Level=18)
 
@@ -1486,11 +1625,15 @@ CONTAINS
     CALL ListPopNamespace()
     Xnorm = SQRT( SUM( x**2) )
     
+    WRITE( Message,'(A,ES12.3)') 'Solution norm: ',Xnorm
+    CALL Info('BlockKrylovIter',Message,Level=8)
+
+
     MaxChange = 2*ABS(Xnorm-PrevXnorm)/(Xnorm+PrevXnorm)
     PrevXNorm = Xnorm
 
     WRITE( Message,'(A,ES12.3)') 'Relative change: ',MaxChange
-    CALL Info('BlockKrylovIter','Level=12')
+    CALL Info('BlockKrylovIter',Message,Level=8)
     
     DO i=1,NoVar
       TotMatrix % SubVector(i) % Var % Values(1:offset(i+1)-offset(i)) = & 
@@ -1521,7 +1664,8 @@ CONTAINS
     END IF
 
     CALL Info('BlockKrylovIter','Finished block krylov iteration',Level=20)
-   
+
+    
   END SUBROUTINE blockKrylovIter
 
 
@@ -1562,6 +1706,7 @@ CONTAINS
     CALL Info('BlockSolver','---------------------------------------',Level=5)
 
     Params => Solver % Values
+
     Mesh => Solver % Mesh
     PSolver => Solver
 
@@ -1697,6 +1842,7 @@ CONTAINS
     CALL Info('BlockSolverInt','All done')
     CALL Info('BlockSolverInt','-------------------------------------------------',Level=5)
 
+    
   END SUBROUTINE BlockSolveInt
 END MODULE BlockSolve
 
@@ -1712,7 +1858,11 @@ SUBROUTINE BlockSolveExt(A,x,b,Solver)
     TYPE(Solver_t) :: Solver
     REAL(KIND=dp) :: x(:),b(:)
 !------------------------------------------------------------------------------
+
+    ! Eliminate recursion for block solvers. 
+    CALL ListAddLogical(Solver % Values,'Linear System Block Mode',.FALSE.)
     CALL BlockSolveInt(A,x,b,Solver)
+    CALL ListAddLogical(Solver % Values,'Linear System Block Mode',.TRUE.)
 !------------------------------------------------------------------------------
 END SUBROUTINE BlockSolveExt
 !------------------------------------------------------------------------------

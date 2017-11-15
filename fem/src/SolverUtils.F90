@@ -11054,19 +11054,18 @@ END FUNCTION SearchNodeL
           TYPE(Solver_t) :: Solver
           REAL(KIND=dp) :: x(:), b(:)
        END SUBROUTINE FetiSolver
-
-       SUBROUTINE BlockSolveExt(A,x,b,Solver)
-          USE Types
-          TYPE(Matrix_t), POINTER :: A
-          TYPE(Solver_t) :: Solver
-          REAL(KIND=dp) :: x(:), b(:)
-       END SUBROUTINE BlockSolveExt
     END INTERFACE
 !------------------------------------------------------------------------------
 
-   ComplexSystem=ListGetLogical( Solver % Values, 'Linear System Complex', GotIt )
+   ComplexSystem = ListGetLogical( Solver % Values, 'Linear System Complex', GotIt )
    IF ( GotIt ) A % COMPLEX = ComplexSystem
-
+ 
+   IF( A % COMPLEX ) THEN
+     CALL Info('SolveLinearSystem','Assuming complex valued linear system',Level=6)
+   ELSE
+     CALL Info('SolveLinearSystem','Assuming real valued linear system',Level=8)
+   END IF
+   
 !------------------------------------------------------------------------------
 !   If parallel execution, check for parallel matrix initializations
 !------------------------------------------------------------------------------
@@ -11347,8 +11346,8 @@ END FUNCTION SearchNodeL
       CASE('feti')
         CALL Fatal('SolveLinearSystem', &
             'Feti solver available only in parallel.')
-      CASE('block')
-        CALL BlockSolveExt( A, x, b, Solver )
+      !CASE('block')
+      !  CALL BlockSolveExt( A, x, b, Solver )
       CASE DEFAULT
         CALL DirectSolver( A, x, b, Solver )
       END SELECT
@@ -11362,8 +11361,8 @@ END FUNCTION SearchNodeL
             x, b, Solver, A % ParMatrix )
       CASE('feti')
         CALL FetiSolver( A, x, b, Solver )
-      CASE('block')
-        CALL BlockSolveExt( A, x, b, Solver )
+      !CASE('block')
+      !  CALL BlockSolveExt( A, x, b, Solver )
      CASE DEFAULT
         CALL DirectSolver( A, x, b, Solver )
       END SELECT
@@ -11578,14 +11577,24 @@ END FUNCTION SearchNodeL
       END FUNCTION ExecLinSolveProcs
     END INTERFACE
 #endif
-    LOGICAL :: ConstraintBlock
+    LOGICAL :: ConstraintBlock, BlockMode
 
+
+    INTERFACE 
+      SUBROUTINE BlockSolveExt(A,x,b,Solver)
+        USE Types
+        TYPE(Matrix_t), POINTER :: A
+        TYPE(Solver_t) :: Solver
+        REAL(KIND=dp) :: x(:), b(:)
+      END SUBROUTINE BlockSolveExt
+    END INTERFACE
     
 !------------------------------------------------------------------------------
     Params => Solver % Values
 
     CALL Info('SolveSystem','Solving linear system',Level=10)
 
+        
     Timing = ListCheckPrefix(Params,'Linear System Timing')
     IF( Timing ) THEN
       t0 = CPUTime(); rt0 = RealTime()
@@ -11593,8 +11602,16 @@ END FUNCTION SearchNodeL
 
     n = A % NumberOfRows
 
-    ResidualMode = ListGetLogical( Params,'Linear System Residual Mode',Found )
+    PRINT *,'start rhs norm',SQRT( SUM( b(1:n)**2 ) )    
+    PRINT *,'start sol norm',SQRT( SUM( x(1:n)**2 ) )
+    PRINT *,'matrix norm',SQRT( SUM( A % Values**2 ) )
+       
 
+    
+    ResidualMode = ListGetLogical( Params,'Linear System Residual Mode',Found )
+    
+    BlockMode = ListGetLogical( Params,'Linear System Block Mode',Found ) 
+    
     ConstraintBlock = ListGetLogical( Params,'Linear System Constraint Blocks',Found )
     IF( ConstraintBlock ) CALL Info('SolveSystem','Treating constraints as blocks',Level=12)
 
@@ -11673,8 +11690,11 @@ END FUNCTION SearchNodeL
       ConstrainedSolve = ParallelReduction(ConstrainedSolve*1._dp)
     END IF
 
-      
-    IF ( ConstrainedSolve > 0 ) THEN
+    IF( BlockMode ) THEN
+    
+      CALL BlockSolveExt( A, x, bb, Solver )
+    
+    ELSE IF ( ConstrainedSolve > 0 ) THEN
       CALL Info('SolveSystem','Solving linear system with constraint matrix',Level=10)
       IF( ListGetLogical( Params,'Save Constraint Matrix',Found ) ) THEN
         CALL SaveProjector(A % ConstraintMatrix,.TRUE.,'cm')
@@ -13824,33 +13844,32 @@ CONTAINS
 !------------------------------------------------------------------------------
 !> Assemble mass matrix related to a solver and permutation vector. 
 !------------------------------------------------------------------------------
-  SUBROUTINE FsiCouplingAssembly( Solver, FVar, SVar, A_fs, A_sf )
+  SUBROUTINE FsiCouplingAssembly( Solver, FVar, SVar, A_fs, A_sf, ConstrainedF, ConstrainedS )
     
     TYPE(Solver_t) :: Solver          ! leading solver
     TYPE(Variable_t), POINTER :: FVar ! fluid variable
     TYPE(Variable_t), POINTER :: SVar ! structure variable
     TYPE(Matrix_t), POINTER :: A_fs, A_sf
+    LOGICAL, POINTER :: ConstrainedF(:), ConstrainedS(:)
     !------------------------------------------------------------------------------
     INTEGER, POINTER :: FPerm(:), SPerm(:)
     INTEGER :: FDofs, SDofs
     TYPE(Mesh_t), POINTER :: Mesh
     INTEGER, POINTER :: Indexes(:), pIndexes(:)
-    INTEGER :: i,j,ii,jj,k,n,t,istat,pn
+    INTEGER :: i,j,ii,jj,k,n,t,istat,pn,ifluid,jstruct
     TYPE(Element_t), POINTER :: Element, Parent
     TYPE(GaussIntegrationPoints_t) :: IP
     TYPE(Nodes_t) :: Nodes
     REAL(KIND=dp), ALLOCATABLE :: MASS(:,:)
     REAL(KIND=dp), POINTER :: Basis(:)
-    REAL(KIND=dp) :: detJ, val, c(3), pc(3), Normal(3), coeff, Omega, Rho
-    LOGICAL :: Stat
-    INTEGER :: dim,mat_id
-
-    CALL Info('FsiCouplingAssembly','Creating coupling matrix for harmonic FSI',Level=6)
+    REAL(KIND=dp) :: detJ, val, c(3), pc(3), Normal(3), coeff, Omega, Rho, area
+    LOGICAL :: Stat, IsHarmonic
+    INTEGER :: dim,mat_id,tcount
+    LOGICAL :: FreeF, FreeS, Found
+    REAL(KIND=dp) :: MultSF, MultFS
     
-    Omega = 2 * PI * ListGetCReal( CurrentModel % Simulation,'Frequency',Stat ) 
-    IF( .NOT. Stat) THEN
-      CALL Fatal('FsiCouplingAssembly','Frequency in Simulation list not found!')
-    END IF
+    
+    CALL Info('FsiCouplingAssembly','Creating coupling matrix for harmonic FSI',Level=6)
     
     Mesh => Solver % Mesh
     FPerm => FVar % Perm
@@ -13859,7 +13878,23 @@ CONTAINS
     fdofs = FVar % Dofs
     sdofs = SVar % Dofs
 
-    dim = fdofs / 2
+    ! Here we assume harmonic coupling
+    IF( sdofs > 3 ) THEN
+      IsHarmonic = .TRUE.
+      dim = sdofs / 2
+      CALL Info('FsiCouplingAssembly','Assuming harmonic coupling matrix',Level=10)
+    ELSE
+      IsHarmonic = .FALSE.
+      dim = sdofs
+      CALL Info('FsiCouplingAssembly','Assuming real valued coupling matrix',Level=10)
+    END IF
+
+    IF( IsHarmonic ) THEN
+      Omega = 2 * PI * ListGetCReal( CurrentModel % Simulation,'Frequency',Stat ) 
+      IF( .NOT. Stat) THEN
+        CALL Fatal('FsiCouplingAssembly','Frequency in Simulation list not found!')
+      END IF
+    END IF
     
     
     i = SIZE( FVar % Values ) 
@@ -13871,13 +13906,27 @@ CONTAINS
         ' with '//TRIM(I2S(sdofs))//' components',Level=10)   
     CALL Info('FsiCouplingAssembly','Assuming '//TRIM(I2S(dim))//&
         ' active dimensions',Level=10)   
-    
+
+    ! Add the lasrgest entry that allocates the whole list matrix structure
     CALL AddToMatrixElement(A_fs,i,j,0.0_dp)
     CALL AddToMatrixElement(A_sf,j,i,0.0_dp)
     
     N = Mesh % MaxElementNodes 
     ALLOCATE( Basis(n), MASS(N,N), Nodes % x(n), Nodes % y(n), Nodes % z(n), &
         STAT=istat)
+
+    tcount = 0
+    area = 0.0_dp
+    
+    MultFS = ListGetCReal( Solver % Values,'FS multiplier',Found)
+    IF( .NOT. Found ) MultFS = 1.0_dp
+
+    MultSF = ListGetCReal( Solver % Values,'SF multiplier',Found)
+    IF( .NOT. Found ) MultSF = 1.0_dp
+    
+    FreeS = .TRUE.
+    FreeF = .TRUE.
+    
     
     DO t=Mesh % NumberOfBulkElements+1, &
         Mesh % NumberOfBulkElements + Mesh % NumberOfBoundaryElements
@@ -13895,21 +13944,27 @@ CONTAINS
       Nodes % z(1:n) = Mesh % Nodes % z(Indexes)
       
       Normal = NormalVector( Element, Nodes )
-      
+
+    
       ! The following is done in order to check that the normal points to the fluid      
       Parent => Element % BoundaryInfo % Left
       IF( ASSOCIATED( Parent ) ) THEN
         IF( ANY( FPerm(Parent % NodeIndexes) == 0 ) ) Parent => NULL()
       END IF
-      
-      Parent => Element % BoundaryInfo % Right
-      IF( ASSOCIATED( Parent ) ) THEN
-        IF( ANY( FPerm(Parent % NodeIndexes) == 0 ) ) Parent => NULL()
+
+      IF(.NOT. ASSOCIATED( Parent ) ) THEN
+        Parent => Element % BoundaryInfo % Right
+        IF( ASSOCIATED( Parent ) ) THEN
+          IF( ANY( FPerm(Parent % NodeIndexes) == 0 ) ) Parent => NULL()
+        END IF
       END IF
-      
+                
       ! Could not find a proper fluid element to define the normal 
       IF(.NOT. ASSOCIATED( Parent ) ) CYCLE
 
+      tcount = tcount + 1
+
+      
       pn = Parent % TYPE % NumberOfNodes
       pIndexes => Parent % NodeIndexes
       
@@ -13927,16 +13982,18 @@ CONTAINS
         Normal = -Normal
       END IF
       
-      MASS = 0.0_dp
+      MASS(1:n,1:n) = 0.0_dp
       
       mat_id = ListGetInteger( CurrentModel % Bodies(Parent % BodyId) % Values,'Material' )
       rho = ListGetConstReal( CurrentModel % Materials(mat_id) % Values,'Density',Stat)
       IF( .NOT. Stat) THEN
         CALL Fatal('FsiCouplingAssembly','Fluid density not found!')
       END IF
-      
-      coeff = -rho * omega**2
-      
+
+
+      ! The sign depends on the convection of the normal direction
+      coeff = rho * omega**2
+
       
       ! Numerical integration:
       !----------------------
@@ -13949,31 +14006,67 @@ CONTAINS
         stat = ElementInfo( Element, Nodes, IP % U(k), IP % V(k), &
             IP % W(k),  detJ, Basis )
         
-        ! Finally, the elemental matrix & vector:
+        ! The mass matrix of the boundary element
         !----------------------------------------
+        val = IP % s(k) * detJ
         DO i=1,n
-          val = IP % s(k) * DetJ 
           DO j=1,n
             MASS(i,j) = MASS(i,j) + val * Basis(i) * Basis(j)
           END DO
         END DO
+        area = area + val
       END DO
-      
+
+      ! The mass matrix is symmetric hence there is no difference how to pick i/j 
       DO i=1,n
         ii = Indexes(i)
+
+        IF( IsHarmonic ) THEN
+          ifluid = 2*FPerm(ii)-1                  
+        ELSE
+          ifluid = FPerm(ii)
+        END IF
+          
         DO j=1,n
           jj = Indexes(j)
-
           val = MASS(i,j)
-          
-          DO k=1,dim            
-            ! Fluid load on the structure: tau \cdot n = p * n
-            CALL AddToMatrixElement(A_fs,2*dim*(FPerm(ii)-1)+2*k-1,2*SPerm(jj)-1,val*Normal(k)) ! Re
-            CALL AddToMatrixElement(A_fs,2*dim*(FPerm(ii)-1)+2*k,2*SPerm(jj),val*Normal(k))     ! Im
-            
-            ! Structure load on the fluid: dp/dn = -rho*omega^2*n
-            CALL AddToMatrixElement(A_sf,2*SPerm(jj)-1,2*dim*(FPerm(ii)-1)+2*k-1,val*Normal(k)*coeff) ! Re 
-            CALL AddToMatrixElement(A_sf,2*SPerm(jj)-1,2*dim*(FPerm(ii)-1)+2*k-1,val*Normal(k)*coeff) ! Im
+                   
+          DO k=1,dim
+
+            val = MASS(i,j) * Normal(k)
+
+            IF( IsHarmonic ) THEN
+              jstruct = 2*dim*(SPerm(jj)-1)+2*(k-1)+1  
+
+              ! Fluid load on the structure: tau \cdot n = p * n
+              CALL AddToMatrixElement(A_sf,jstruct,ifluid,MultSF*val)           ! Re terms coupling
+              CALL AddToMatrixElement(A_sf,jstruct+1,ifluid+1,MultSF*val)       ! Im
+
+              ! Structure load on the fluid: dp/dn = -rho*omega^2*n
+              CALL AddToMatrixElement(A_fs,ifluid,jstruct,MultFS*val*coeff)     ! Re 
+              CALL AddToMatrixElement(A_fs,ifluid+1,jstruct+1,MultFS*val*coeff) ! Im
+            ELSE
+              jstruct = dim*(SPerm(jj)-1)+k
+
+              IF( ASSOCIATED( ConstrainedS ) ) THEN
+                FreeS = .NOT. ConstrainedS(jstruct)
+              END IF
+              
+              ! Fluid load on the structure: tau \cdot n = p * n
+              IF( FreeS ) THEN
+                CALL AddToMatrixElement(A_sf,jstruct,ifluid,MultSF*val)           
+              END IF
+
+              IF( ASSOCIATED( ConstrainedF ) ) THEN
+                FreeF = .NOT. ConstrainedF(ifluid)
+              END IF
+                           
+              ! Structure load on the fluid: dp/dn = -u
+              IF( FreeF ) THEN
+                CALL AddToMatrixElement(A_fs,ifluid,jstruct,-MultFS*val)           
+              END IF
+            END IF
+
           END DO
           
         END DO
@@ -13986,7 +14079,18 @@ CONTAINS
     CALL List_toCRSMatrix(A_fs)
     CALL List_toCRSMatrix(A_sf)
 
-    CALL Info('FsiCouplingAssembly','Add done',Level=20)
+    !PRINT *,'interface area:',area
+    !PRINT *,'interface fs sum:',SUM(A_fs % Values)
+    !PRINT *,'interface sf sum:',SUM(A_sf % Values)
+
+    CALL Info('FsiCouplingAssembly','Number of elements on interface: '&
+        //TRIM(I2S(tcount)),Level=10)    
+    CALL Info('FsiCouplingAssembly','Number of entries if fluid-structure matrix: '&
+        //TRIM(I2S(SIZE(A_fs % Values))),Level=10)
+    CALL Info('FsiCouplingAssembly','Number of entries if structure-fluid matrix: '&
+        //TRIM(I2S(SIZE(A_sf % Values))),Level=10)
+    
+    CALL Info('FsiCouplingAssembly','All done',Level=20)
 
     
   END SUBROUTINE FsiCouplingAssembly
